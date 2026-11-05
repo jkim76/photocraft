@@ -127,6 +127,43 @@ No filesystem root is needed for the in-memory commands. External linked sources
 a file read remain refused. See the [control policy](control-protocol.md#engine-commands)
 for the shared restrictions.
 
+### Refused file commands and what to use instead
+
+`command_run` refuses engine commands that would read or write a file by path instead of
+through the roots ("uses ambient filesystem paths and is disabled"); the error names the
+replacement where there is one. The rules are `authorize_engine_command` in
+`crates/automation/src/workspace.rs`, and they apply to every step of `actions.play` too.
+
+| Refused command (shape) | Use instead |
+|---|---|
+| `file.open`, `file.openAs`, `file.revert` | `doc_open` |
+| `file.approveMemory` | `doc_open` with `approve_high_memory: true` |
+| `file.save`, `file.saveAs` | `doc_save` |
+| `file.saveACopy`, `file.export.quickExport`, `file.export.saveForWebLegacy` | `doc_export` (Save for Web's palette options are not available) |
+| `file.placeEmbedded`, `file.placeLinked` | `doc_place` (always embedded) |
+| `layer.smartObjects.replaceContents` | `doc_replace_smart_object` |
+| `layer.smartObjects.exportContents` | `layer.smartObjects.editContents`, then `doc_export` of the contents document |
+| `file.export.layersToFiles` | `doc_export_layers` |
+| `file.import.variableDataSets` / `file.export.dataSetsAsFiles` | `doc_import_data_sets` / `doc_export_data_sets` |
+| `file.export.renderVideo` inside an action | a direct headless `command_run` (it writes beneath the write root) |
+| `measurementLog.export`, `file.export.colorLookupTables`, `file.export.pathsToIllustrator` with `path` | the same command without `path`: the CSV, `.cube` or `.ai` text comes back in the reply (`csv`, `cube`, `ai`) |
+| `file.automate.photomerge`, `file.automate.mergeToHdrPro` with `paths` or `input` | `doc_open` each image, then the command with `useOpenDocuments: true` and no `paths`/`input` |
+| `pattern.import` with `path` | the same command with the file's bytes as base64 `data` |
+
+Smart Object commands that work on the contents held in the document are allowed: Stack Mode
+(`layer.smartObjects.stackMode.*`), Rasterize, New Smart Object via Copy, Convert to Embedded,
+Warp, Puppet Warp and Perspective Warp. On a linked Smart Object they never read the linked
+file: the engine asks the same gate before every linked-file read, so the layer keeps its last
+rendering (Convert to Embedded fails unless the source is embedded in the PSD).
+
+Everything else that needs files or folders outside the roots stays refused with no
+replacement: printing, Reveal in Finder, scripts and Script Events, droplets, folder batches
+(Batch, Image Processor, Lens Correction, Contact Sheet, Load Files into Stack, Statistics),
+the other multi-file exports (layer comps, artboards, Package, Generate Image Assets), linked
+Smart Object file operations (relink, update, convert to linked), video footage, EXR parts,
+notes import, presets stored in the app's settings folder (Export As presets, Migrate Presets,
+pattern export), installed colour profiles and Color Settings, and plug-in reload.
+
 `photocraft://document` and `photocraft://commands` return live JSON matching `doc_inspect`
 and `command_list`. Resource reads are uncached; tool/resource catalogs are private and cached
 for ten minutes. List/read responses include the MCP 2026-07-28 result/cache fields.

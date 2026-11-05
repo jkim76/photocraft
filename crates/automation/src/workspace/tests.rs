@@ -380,12 +380,12 @@ fn filesystem_commands_fail_closed() {
         "file.saveAs",
         "file.saveACopy",
         "file.export.saveForWebLegacy",
-        "pattern.import",
+        "pattern.export",
         "layer.smartObjects.exportContents",
         "layer.smartObjects.replaceContents",
         "layer.smartObjects.relinkToFile",
         "layer.smartObjects.convertToLinked",
-        "measurementLog.export",
+        "layer.smartObjects.updateModifiedContent",
         "layer.videoLayers.reloadFrame",
         "edit.colorSettings",
     ] {
@@ -399,6 +399,174 @@ fn filesystem_commands_fail_closed() {
     }
     for id in ["layer.smartObjects.editContents", "layer.smartObjects.convertToLayers"] {
         assert!(authorize_engine_command(id, &serde_json::json!({"path": "/outside/source.psb"})).is_err(), "{id}");
+    }
+}
+
+/// Shapes the gate lets through because the engine does no file I/O for them, next to the
+/// shapes of the same commands that still read or write a file.
+#[test]
+fn path_free_shapes_of_file_commands_are_allowed() {
+    use serde_json::json;
+    let check = |id: &str, params: serde_json::Value, allowed: bool| {
+        assert_eq!(authorize_engine_command(id, &params).is_ok(), allowed, "{id} {params}");
+        assert_eq!(authorize_engine_step(id, &params).is_ok(), allowed, "nested {id} {params}");
+        assert_eq!(authorize_desktop_engine_command(id, &params).is_ok(), allowed, "desktop {id} {params}");
+    };
+    // Text exports: without `path` the text comes back in the reply.
+    for id in ["measurementLog.export", "file.export.colorLookupTables", "file.export.pathsToIllustrator"] {
+        check(id, json!({}), true);
+        check(id, json!({"path": null, "size": 17}), true);
+        check(id, json!({"path": "/outside/out.txt"}), false);
+        check(id, json!({"path": ""}), false);
+    }
+    // Patterns: base64 bytes are in memory; `path` wins over `data` in the engine.
+    check("pattern.import", json!({"data": "AAAA"}), true);
+    check("pattern.import", json!({"path": "/outside/p.pat"}), false);
+    check("pattern.import", json!({"path": "/outside/p.pat", "data": "AAAA"}), false);
+    // Photomerge and Merge to HDR Pro on the open documents only.
+    for id in ["file.automate.photomerge", "file.automate.mergeToHdrPro"] {
+        check(id, json!({"useOpenDocuments": true}), true);
+        check(id, json!({"useOpenDocuments": true, "paths": null}), true);
+        check(id, json!({"useOpenDocuments": true, "paths": ["/outside/a.jpg"]}), false);
+        check(id, json!({"paths": "/outside/folder"}), false);
+        check(id, json!({"useOpenDocuments": true, "input": "/outside/folder"}), false);
+    }
+    // Smart Object commands on the contents held in the document.
+    for mode in ["none", "entropy", "kurtosis", "maximum", "mean", "median", "minimum", "range", "skewness", "standardDeviation", "summation", "variance"] {
+        check(&format!("layer.smartObjects.stackMode.{mode}"), json!({"layer": 3}), true);
+    }
+    for id in [
+        "layer.smartObjects.newSmartObjectViaCopy",
+        "layer.smartObjects.rasterize",
+        "layer.smartObjects.convertToEmbedded",
+        "layer.smartObjects.warp",
+        "layer.smartObjects.puppetWarp",
+        "layer.smartObjects.perspectiveWarp",
+    ] {
+        check(id, json!({}), true);
+    }
+    // Linked files on disk stay refused, and so does the check every linked-file read makes.
+    for id in [
+        "layer.smartObjects.updateModifiedContent",
+        "layer.smartObjects.updateAllModifiedContent",
+        "layer.smartObjects.updateChanged",
+        "layer.smartObjects.relinkToFile",
+        "layer.smartObjects.convertToLinked",
+        "layer.smartObjects.revealInFinder",
+        "layer.smartObjects.updateVectorSource",
+    ] {
+        check(id, json!({}), false);
+    }
+    check("layer.smartObjects.updateModifiedContent", json!({"path": "/outside/linked.png"}), false);
+    // Commands that always read files keep their refusal.
+    for id in ["file.scripts.statistics", "file.scripts.loadFilesIntoStack", "file.automate.lensCorrection", "file.automate.batch"] {
+        check(id, json!({}), false);
+    }
+}
+
+/// A refusal names the capability-scoped tool that does the same job, where there is one.
+#[test]
+fn refusals_name_the_capability_tool_to_use_instead() {
+    use serde_json::json;
+    for (id, params, tool) in [
+        ("file.saveACopy", json!({"path": "/outside/a.png"}), "`doc_export`"),
+        ("file.export.quickExport", json!({}), "`doc_export`"),
+        ("file.openAs", json!({"path": "/outside/a.png"}), "`doc_open`"),
+        ("file.revert", json!({}), "`doc_open`"),
+        ("file.placeEmbedded", json!({"path": "/outside/a.png"}), "`doc_place`"),
+        ("layer.smartObjects.replaceContents", json!({"path": "/outside/a.png"}), "`doc_replace_smart_object`"),
+        ("file.export.layersToFiles", json!({"dir": "/outside"}), "`doc_export_layers`"),
+        ("file.import.variableDataSets", json!({"path": "/outside/a.csv"}), "`doc_import_data_sets`"),
+        ("file.export.dataSetsAsFiles", json!({"dir": "/outside"}), "`doc_export_data_sets`"),
+        ("file.export.colorLookupTables", json!({"path": "/outside/a.cube"}), "omit `path`"),
+        ("file.automate.photomerge", json!({"paths": ["/outside/a.jpg"]}), "`useOpenDocuments: true`"),
+        ("pattern.import", json!({"path": "/outside/a.pat"}), "base64 `data`"),
+    ] {
+        let refused = authorize_engine_command(id, &params).unwrap_err().to_string();
+        assert!(refused.contains("ambient filesystem paths") && refused.contains(tool), "{id}: {refused}");
+    }
+    let refused = authorize_engine_command("file.print", &json!({})).unwrap_err().to_string();
+    assert!(refused.ends_with("use capability-scoped document methods"), "{refused}");
+}
+
+/// A headless session runs the newly allowed shapes: stack modes on an embedded smart object,
+/// text exports, and the same commands as steps of an action.
+#[test]
+fn headless_runs_path_free_file_commands() {
+    use serde_json::json;
+    let mut headless = crate::Headless::new();
+    headless.command_run("file.new", json!({"width": 16, "height": 16, "background": "white"})).unwrap();
+    headless.command_run("layer.smartObjects.convertToSmartObject", json!({})).unwrap();
+    assert_eq!(headless.command_run("layer.smartObjects.stackMode.median", json!({})).unwrap()["stackMode"], "median");
+    headless.command_run("layer.smartObjects.newSmartObjectViaCopy", json!({})).unwrap();
+    headless.command_run("layer.smartObjects.rasterize", json!({})).unwrap();
+    headless.command_run("layer.newAdjustmentLayer.invert", json!({})).unwrap();
+    let lut = headless.command_run("file.export.colorLookupTables", json!({"size": 2})).unwrap();
+    assert!(lut["cube"].as_str().unwrap().contains("LUT_3D_SIZE 2"), "{lut}");
+    let csv = headless.command_run("measurementLog.export", json!({})).unwrap();
+    assert!(csv["csv"].is_string(), "{csv}");
+    assert!(headless.command_run("file.export.colorLookupTables", json!({"path": "out.cube"})).is_err());
+    // Nested steps go through the same gate: the path-free export runs, the file write stops it.
+    let mut headless = crate::Headless::new();
+    headless.command_run("file.new", json!({"width": 16, "height": 16, "background": "white"})).unwrap();
+    let steps = vec![
+        ("layer.smartObjects.convertToSmartObject".to_string(), json!({})),
+        ("layer.smartObjects.stackMode.mean".to_string(), json!({})),
+        ("measurementLog.export".to_string(), json!({})),
+        ("measurementLog.export".to_string(), json!({"path": "log.csv"})),
+    ];
+    headless.session.actions.list.push(photocraft_engine::actions_cmds::Action::new("Gate", steps));
+    let played = headless.command_run("actions.play", json!({"action": "Gate"})).unwrap();
+    assert_eq!(played["failed"]["step"], 3, "{played}");
+    assert!(played["failed"]["error"].as_str().unwrap().contains("ambient filesystem paths"), "{played}");
+    assert!(!std::path::Path::new("log.csv").exists());
+}
+
+/// The smart object commands allowed for embedded contents never read a linked source outside
+/// the roots: the engine asks the gate before every linked-file read.
+#[test]
+fn allowed_smart_object_commands_do_not_read_a_linked_file() {
+    use photocraft_doc::{LayerContent, SmartSource};
+    use serde_json::json;
+    let (_, outside, _) = roots("linked-smart-commands");
+    let red = photocraft_codecs::Image::from_u8(8, 8, photocraft_codecs::ChannelLayout::Rgb, [255, 0, 0].repeat(64)).unwrap();
+    let linked = outside.join("red.png");
+    std::fs::write(&linked, photocraft_codecs::encode(&red, photocraft_codecs::Format::Png, &Default::default()).unwrap()).unwrap();
+    let mut headless = crate::Headless::new();
+    headless.command_run("file.new", json!({"width": 8, "height": 8, "background": "white"})).unwrap();
+    headless.command_run("layer.smartObjects.convertToSmartObject", json!({})).unwrap();
+    let doc = Arc::make_mut(&mut headless.session.active_mut().unwrap().doc);
+    let LayerContent::Smart(sm) = &mut doc.layers[0].content else { panic!("smart object") };
+    sm.source = SmartSource::Linked { path: linked.to_string_lossy().into_owned() };
+    let layer = doc.layers[0].id.0;
+    // The white rendering stays: no smart object (the copy too) shows the red linked file.
+    let not_red = |headless: &crate::Headless| {
+        headless.session.active().unwrap().doc.layers.iter().all(|l| match &l.content {
+            LayerContent::Smart(sm) => sm.cache.as_ref().is_none_or(|cache| cache.rgba(4, 4)[1] > 0.99),
+            _ => true,
+        })
+    };
+    assert!(headless.command_run("layer.smartObjects.convertToEmbedded", json!({"layer": layer})).is_err());
+    let doc = &headless.session.active().unwrap().doc;
+    let LayerContent::Smart(sm) = &doc.layers[0].content else { panic!("smart object") };
+    assert!(matches!(sm.source, SmartSource::Linked { .. }), "nothing was embedded from the linked file");
+    for (id, params) in [
+        ("layer.smartObjects.stackMode.median", json!({"layer": layer})),
+        ("layer.smartObjects.warp", json!({"layer": layer, "style": "bulge", "bend": 30})),
+        (
+            "layer.smartObjects.perspectiveWarp",
+            json!({"layer": layer, "planes": [{"src": [[0, 0], [8, 0], [8, 8], [0, 8]], "dst": [[1, 0], [8, 0], [8, 8], [0, 8]]}]}),
+        ),
+        ("layer.smartObjects.newSmartObjectViaCopy", json!({"layer": layer})),
+    ] {
+        let _ = headless.command_run(id, params);
+        assert!(not_red(&headless), "{id} rendered the linked file outside the roots");
+    }
+    let doc = &headless.session.active().unwrap().doc;
+    for l in &doc.layers {
+        if let LayerContent::Smart(sm) = &l.content {
+            assert!(!matches!(sm.source, SmartSource::Embedded { .. }), "{} embedded the linked file", l.name);
+        }
     }
 }
 

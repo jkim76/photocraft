@@ -366,28 +366,21 @@ pub fn authorize_engine_command(id: &str, params: &Value) -> Result<(), Automati
             | "file.scripts.flattenAllMasks"
             | "file.scripts.deleteAllEmptyLayers"
             | "file.export.exportPreferences"
+            // Judged by their params in `command_uses_ambient_path`: text back without `path`,
+            // the open documents as input without `paths`.
+            | "file.export.colorLookupTables"
+            | "file.export.pathsToIllustrator"
+            | "file.automate.photomerge"
+            | "file.automate.mergeToHdrPro"
     );
     if id.starts_with("file.") && !safe_file_command {
         return Err(command_error(id));
     }
-    // Contents commands re-check the resolved source in the engine before any disk read.
-    // Photoshop's embedded linked-layer blocks count as in-memory sources too.
-    let in_memory_smart_command = matches!(
-        id,
-        "layer.smartObjects.convertToSmartObject"
-            | "layer.smartObjects.editContents"
-            | "layer.smartObjects.convertToLayers"
-            | "layer.smartObjects.saveContents"
-            | "layer.smartObjects.exportSvg"
-            | "layer.smartObjects.updateSvg"
-    );
-    if (id.starts_with("layer.smartObjects.") && !in_memory_smart_command)
+    if (id.starts_with("layer.smartObjects.") && !in_memory_smart_command(id))
         || matches!(
             id,
-            "pattern.import"
-                | "pattern.export"
+            "pattern.export"
                 | "edit.presets.migratePresets"
-                | "measurementLog.export"
                 | "layer.videoLayers.newVideoLayerFromFile"
                 | "layer.videoLayers.replaceFootage"
                 | "layer.videoLayers.reloadFrame"
@@ -400,6 +393,32 @@ pub fn authorize_engine_command(id: &str, params: &Value) -> Result<(), Automati
         return Err(command_error(id));
     }
     Ok(())
+}
+
+/// Smart Object commands that work on the contents held in the document. A linked source is
+/// a path stored in the document, not in the params, so the engine judges it again at the read:
+/// every linked-file read (`smart_cmds::source::read_file`) first asks the session's gate about
+/// `layer.smartObjects.updateModifiedContent`, which stays refused here, and `Session::execute`
+/// installs that gate for the whole command and its jobs. On a linked source these commands then
+/// work from the last rendering (or fail, as Convert to Embedded does) without reading the file.
+/// The contents commands also re-check the resolved source before any read (`authorize_source`).
+/// Photoshop's embedded linked-layer blocks count as in-memory sources.
+fn in_memory_smart_command(id: &str) -> bool {
+    matches!(
+        id,
+        "layer.smartObjects.convertToSmartObject"
+            | "layer.smartObjects.editContents"
+            | "layer.smartObjects.convertToLayers"
+            | "layer.smartObjects.saveContents"
+            | "layer.smartObjects.exportSvg"
+            | "layer.smartObjects.updateSvg"
+            | "layer.smartObjects.newSmartObjectViaCopy"
+            | "layer.smartObjects.rasterize"
+            | "layer.smartObjects.convertToEmbedded"
+            | "layer.smartObjects.warp"
+            | "layer.smartObjects.puppetWarp"
+            | "layer.smartObjects.perspectiveWarp"
+    ) || id.starts_with("layer.smartObjects.stackMode.")
 }
 
 /// Desktop sessions may already contain user-configured ambient colour-profile
@@ -507,9 +526,20 @@ fn command_uses_ambient_path(id: &str, params: &Value) -> bool {
         "edit.keyboardShortcuts" => {
             params.get("path").is_some() || ["importKys", "exportKys", "summarize"].iter().any(|k| params.get(*k).and_then(|v| v.get("path")).is_some())
         }
+        // Path wins over `data` here: only the base64 bytes are in-memory.
+        "pattern.import" => present(params, "path"),
+        // With a `path` the text is written there; without one it comes back in the reply.
+        "measurementLog.export" | "file.export.colorLookupTables" | "file.export.pathsToIllustrator" => present(params, "path"),
+        // Files or a folder are read; `useOpenDocuments` alone merges the open documents.
+        "file.automate.photomerge" | "file.automate.mergeToHdrPro" => present(params, "paths") || present(params, "input"),
         "plugin.reload" => true,
         _ => false,
     }
+}
+
+/// `key` is given a value (JSON `null` counts as left out, as the engine reads it).
+fn present(params: &Value, key: &str) -> bool {
+    params.get(key).is_some_and(|value| !value.is_null())
 }
 
 fn looks_like_path(value: &str) -> bool {
@@ -521,7 +551,32 @@ fn looks_like_path(value: &str) -> bool {
 }
 
 fn command_error(id: &str) -> AutomationError {
-    AutomationError::BadRequest(format!("automation command `{id}` uses ambient filesystem paths and is disabled; use capability-scoped document methods"))
+    let instead = capability_alternative(id).unwrap_or("use capability-scoped document methods");
+    AutomationError::BadRequest(format!("automation command `{id}` uses ambient filesystem paths and is disabled; {instead}"))
+}
+
+/// What to use instead of a refused command (docs/mcp.md, "Refused file commands").
+fn capability_alternative(id: &str) -> Option<&'static str> {
+    Some(match id {
+        "file.open" | "file.openAs" | "file.revert" => "open the file beneath the read root with the MCP tool `doc_open`",
+        "file.approveMemory" => "open the file with the MCP tool `doc_open` and `approve_high_memory: true`",
+        "file.save" | "file.saveAs" => "save beneath the write root with the MCP tool `doc_save`",
+        "file.saveACopy" | "file.export.quickExport" | "file.export.saveForWebLegacy" => "export beneath the write root with the MCP tool `doc_export`",
+        "file.placeEmbedded" | "file.placeLinked" => "place the file beneath the read root, embedded, with the MCP tool `doc_place`",
+        "layer.smartObjects.replaceContents" => "replace the contents from the read root with the MCP tool `doc_replace_smart_object`",
+        "layer.smartObjects.exportContents" => "run `layer.smartObjects.editContents`, then save the contents document with the MCP tool `doc_export`",
+        "file.export.layersToFiles" => "export the layers beneath the write root with the MCP tool `doc_export_layers`",
+        "file.import.variableDataSets" => "import the CSV from the read root with the MCP tool `doc_import_data_sets`",
+        "file.export.dataSetsAsFiles" => "export the data sets beneath the write root with the MCP tool `doc_export_data_sets`",
+        "measurementLog.export" | "file.export.colorLookupTables" | "file.export.pathsToIllustrator" => {
+            "omit `path` to get the text in the reply, then write it yourself or keep it"
+        }
+        "file.automate.photomerge" | "file.automate.mergeToHdrPro" => {
+            "open the images with the MCP tool `doc_open`, then pass `useOpenDocuments: true` without `paths` or `input`"
+        }
+        "pattern.import" => "pass the .pat file's bytes as base64 `data` instead of `path`",
+        _ => return None,
+    })
 }
 
 /// An export owns only files it created through this held directory capability. Refuse
